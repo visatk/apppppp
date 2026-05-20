@@ -1,12 +1,23 @@
-export default {
-  fetch(request) {
-    const url = new URL(request.url);
+import { Hono } from 'hono';
 
-    if (url.pathname.startsWith("/api/")) {
-      return Response.json({
-        name: "Cloudflare",
-      });
-    }
-		return new Response(null, { status: 404 });
-  },
-} satisfies ExportedHandler<Env>;
+// Define the Cloudflare Environment bindings
+export type Env = {
+  DB: D1Database;
+};
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.get('/api/', (c) => {
+  return c.json({
+    name: "Cloudflare Workers + Hono",
+  });
+});
+
+// Add strict D1/Drizzle route example
+app.get('/api/health', async (c) => {
+  // Ensure DB binding is accessible
+  const dbStatus = c.env.DB ? "connected" : "disconnected";
+  return c.json({ status: "ok", database: dbStatus });
+});
+
+export default app;
