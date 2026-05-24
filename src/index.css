@@ -1,3 +1,10 @@
 @import "tailwindcss";
 
-/* Custom utility classes or theme overrides go here */
+.xterm-viewport::-webkit-scrollbar { width: 12px; }
+.xterm-viewport::-webkit-scrollbar-track { background: #020617; }
+.xterm-viewport::-webkit-scrollbar-thumb { 
+    background: #0f172a; 
+    border: 2px solid #020617; 
+    border-radius: 4px; 
+}
+.xterm-viewport::-webkit-scrollbar-thumb:hover { background: #1e293b; }
