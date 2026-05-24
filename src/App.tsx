@@ -6,24 +6,18 @@ import '@xterm/xterm/css/xterm.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 const terminalTheme = {
-  background: '#020617', // slate-950
-  foreground: '#10b981', // emerald-500
-  cursor: '#10b981', 
-  cursorAccent: '#020617',
-  selectionBackground: '#064e3b80', 
-  selectionForeground: '#ffffff',
-  selectionInactiveBackground: '#064e3b40',
-  black: '#020617', red: '#ef4444', green: '#10b981', yellow: '#eab308',
-  blue: '#3b82f6', magenta: '#d946ef', cyan: '#06b6d4', white: '#f8fafc',
-  brightBlack: '#475569', brightRed: '#f87171', brightGreen: '#34d399',
-  brightYellow: '#fde047', brightBlue: '#60a5fa', brightMagenta: '#e879f9',
-  brightCyan: '#22d3ee', brightWhite: '#ffffff'
+  background: '#020617', foreground: '#10b981', cursor: '#10b981', cursorAccent: '#020617',
+  selectionBackground: '#064e3b80', selectionForeground: '#ffffff', selectionInactiveBackground: '#064e3b40',
+  black: '#020617', red: '#ef4444', green: '#10b981', yellow: '#eab308', blue: '#3b82f6',
+  magenta: '#d946ef', cyan: '#06b6d4', white: '#f8fafc', brightBlack: '#475569',
+  brightRed: '#f87171', brightGreen: '#34d399', brightYellow: '#fde047',
+  brightBlue: '#60a5fa', brightMagenta: '#e879f9', brightCyan: '#22d3ee', brightWhite: '#ffffff'
 };
 
 interface User { id: string; name: string; color: string; }
 interface AppState {
   connected: boolean; roomId: string | null; userId: string | null;
-  users: User[]; hasActivePty: boolean; typingUser: User | null;
+  users: User[]; hasActivePty: boolean; typingUser: User | null; isBooting: boolean;
 }
 
 function generateId(): string {
@@ -34,7 +28,7 @@ function generateId(): string {
 
 export function App() {
   const [state, setState] = useState<AppState>({
-    connected: false, roomId: null, userId: null, users: [], hasActivePty: false, typingUser: null
+    connected: false, roomId: null, userId: null, users: [], hasActivePty: false, typingUser: null, isBooting: false
   });
 
   const [joinName, setJoinName] = useState('');
@@ -46,8 +40,8 @@ export function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const addonRef = useRef<SandboxAddon | null>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTypingSyncRef = useRef<number>(0);
 
-  // 1. Connect to Collaboration Presence
   const connectToRoom = useCallback((roomId: string, userName: string) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/room/${roomId}?name=${encodeURIComponent(userName)}`);
@@ -69,7 +63,10 @@ export function App() {
           setState(s => ({ ...s, users: message.users }));
           break;
         case 'pty_started':
-          setState(s => ({ ...s, hasActivePty: true }));
+          setState(s => ({ ...s, hasActivePty: true, isBooting: false }));
+          break;
+        case 'pty_exited':
+          setState(s => ({ ...s, hasActivePty: false, isBooting: false }));
           break;
         case 'user_typing':
           setState(s => ({ ...s, typingUser: message.user }));
@@ -85,7 +82,6 @@ export function App() {
     });
   }, []);
 
-  // 2. Initialize Terminal with Cloudflare Native SandboxAddon
   useEffect(() => {
     if (!state.connected || !terminalRef.current || xtermRef.current || !state.roomId) return;
 
@@ -99,22 +95,25 @@ export function App() {
     term.loadAddon(fitAddon);
     term.loadAddon(new WebLinksAddon());
 
-    // 🚀 NEW: Auto-managed WebSocket connection via SandboxAddon
     const sandboxAddon = new SandboxAddon({
       getWebSocketUrl: ({ origin }) => {
         const wsOrigin = origin.replace(/^http/, 'ws');
         return `${wsOrigin}/ws/terminal?room=${state.roomId}`;
       },
       onStateChange: (terminalState, error) => {
-        if (terminalState === 'disconnected' && error) {
-          term.writeln(`\r\n\x1b[31m[Session Drop: ${error.message}]\x1b[0m`);
+        // BUG FIX: Auto-Recovery on Disconnect
+        if (terminalState === 'disconnected') {
+          term.writeln(`\r\n\x1b[31m[Session Drop: ${error?.message || 'Connection closed by remote host'}]\x1b[0m`);
+          setState(s => ({ ...s, hasActivePty: false, isBooting: false }));
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: 'pty_exited' }));
+          }
         }
       }
     });
 
     term.loadAddon(sandboxAddon);
     term.open(terminalRef.current);
-    
     setTimeout(() => fitAddon.fit(), 0);
     xtermRef.current = term;
     addonRef.current = sandboxAddon;
@@ -122,7 +121,6 @@ export function App() {
     const handleResize = () => fitAddon.fit();
     window.addEventListener('resize', handleResize);
 
-    // If session is already booted by another analyst, connect directly
     if (state.hasActivePty) sandboxAddon.connect({ sandboxId: state.roomId });
 
     return () => {
@@ -134,20 +132,22 @@ export function App() {
     };
   }, [state.connected, state.roomId]);
 
-  // Connect native terminal when PTY starts
   useEffect(() => {
-    if (state.hasActivePty && addonRef.current && state.roomId) {
+    if (state.hasActivePty && addonRef.current && state.roomId && !state.isBooting) {
       addonRef.current.connect({ sandboxId: state.roomId });
     }
-  }, [state.hasActivePty, state.roomId]);
+  }, [state.hasActivePty, state.roomId, state.isBooting]);
 
-  // Send typing event indicator to peers
   useEffect(() => {
     const term = xtermRef.current;
     if (!term) return;
+    
+    // PERFORMANCE FIX: Throttle typing broadcasts to 1 per second max
     const disposable = term.onData(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN && state.hasActivePty) {
+      const now = Date.now();
+      if (wsRef.current?.readyState === WebSocket.OPEN && state.hasActivePty && (now - lastTypingSyncRef.current > 1000)) {
         wsRef.current.send(JSON.stringify({ type: 'user_typing' }));
+        lastTypingSyncRef.current = now;
       }
     });
     return () => disposable.dispose();
@@ -155,6 +155,7 @@ export function App() {
 
   const startPty = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
+      setState(s => ({ ...s, isBooting: true }));
       wsRef.current.send(JSON.stringify({ type: 'start_pty' }));
     }
   }, []);
@@ -179,7 +180,7 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50 font-sans relative overflow-hidden flex flex-col selection:bg-emerald-500/30">
-      <div className="fixed inset-0 pointer-events-none bg-[image:linear-gradient(rgba(16,185,129,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.03)_1px,transparent_1px)] bg-[size:40px_40px]" />
+      <div className="fixed inset-0 pointer-events-none bg-[image:linear-gradient(rgba(16,185,129,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.03)_1px,transparent_1px)] bg-[size:40px_40px] opacity-70 animate-[pulse_10s_ease-in-out_infinite]" />
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(16,185,129,0.1),transparent)]" />
 
       {!state.connected ? (
@@ -246,13 +247,14 @@ export function App() {
           <header className="flex items-center justify-between px-6 py-3 bg-slate-950 border-b border-emerald-900/50 gap-4">
             <div className="flex items-center gap-6">
               <div className="flex items-center gap-2 text-emerald-500">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                {/* Lock icon representing security */}
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-xs font-mono text-slate-500 uppercase tracking-widest">Active Relay</span>
                 <code className="px-2 py-1 bg-slate-900 border border-slate-800 rounded font-mono text-sm text-emerald-400">{state.roomId}</code>
                 <button onClick={copyRoomLink} className="text-slate-500 hover:text-emerald-400 transition-colors">
-                  {copied ? <span className="text-xs font-mono uppercase">Copied</span> : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>}
+                  {copied ? <span className="text-xs font-mono uppercase text-emerald-400">Copied</span> : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>}
                 </button>
               </div>
             </div>
@@ -260,7 +262,7 @@ export function App() {
             <div className="flex items-center gap-4">
               <div className="flex -space-x-2">
                 {state.users.map((u) => (
-                  <div key={u.id} className="w-8 h-8 rounded border-2 border-slate-950 flex items-center justify-center text-xs font-bold font-mono" style={{ backgroundColor: u.color, color: '#020617' }} title={u.name}>
+                  <div key={u.id} className="w-8 h-8 rounded border-2 border-slate-950 flex items-center justify-center text-xs font-bold font-mono shadow-sm" style={{ backgroundColor: u.color, color: '#020617' }} title={u.name}>
                     {u.name.slice(0, 2).toUpperCase()}
                   </div>
                 ))}
@@ -269,7 +271,7 @@ export function App() {
           </header>
 
           <section className="flex-1 p-4 md:p-6 flex justify-center items-start">
-            <div className="w-full max-w-[1600px] h-full max-h-[85vh] flex flex-col bg-slate-950 border border-emerald-900/40 rounded-lg overflow-hidden shadow-[0_0_40px_rgba(16,185,129,0.05)]">
+            <div className="w-full max-w-[1600px] h-full max-h-[85vh] flex flex-col bg-slate-950 border border-emerald-900/40 rounded-lg overflow-hidden shadow-[0_0_40px_rgba(16,185,129,0.08)]">
               
               <div className="flex items-center px-4 py-2 bg-slate-900 border-b border-emerald-900/40">
                 <div className="flex-1 text-xs text-emerald-500/70 font-mono tracking-widest uppercase flex items-center gap-4">
@@ -277,17 +279,19 @@ export function App() {
                   {state.typingUser && <span className="text-emerald-400">[{state.typingUser.name} is typing...]</span>}
                 </div>
                 {!state.hasActivePty && (
-                  <button onClick={startPty} className="px-4 py-1.5 bg-emerald-900/50 hover:bg-emerald-800/50 text-emerald-400 border border-emerald-800 rounded text-xs font-mono uppercase transition-colors">
-                    Execute Boot Sequence
+                  <button onClick={startPty} disabled={state.isBooting} className="px-4 py-1.5 bg-emerald-900/50 hover:bg-emerald-800/50 text-emerald-400 border border-emerald-800 rounded text-xs font-mono uppercase transition-colors disabled:opacity-50 flex items-center gap-2">
+                    {state.isBooting ? <><span className="w-3 h-3 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" /> BOOTING...</> : 'Execute Boot Sequence'}
                   </button>
                 )}
               </div>
 
-              <div className="flex-1 relative bg-[#020617]">
+              {/* UX FIX: Clicking anywhere in this background focuses the terminal */}
+              <div className="flex-1 relative bg-[#020617] cursor-text" onClick={() => xtermRef.current?.focus()}>
                 <div ref={terminalRef} className={`absolute inset-0 p-4 transition-opacity duration-300 ${!state.hasActivePty ? 'opacity-0' : 'opacity-100'}`} />
+                
                 {!state.hasActivePty && (
-                  <div className="absolute inset-0 flex items-center justify-center font-mono text-slate-500 text-sm">
-                    SYSTEM IDLE. INITIATE BOOT SEQUENCE TO MOUNT FILE SYSTEM.
+                  <div className="absolute inset-0 flex items-center justify-center font-mono text-slate-500 text-sm pointer-events-none">
+                    {state.isBooting ? 'INITIALIZING CONTAINERS...' : 'SYSTEM IDLE. INITIATE BOOT SEQUENCE TO MOUNT FILE SYSTEM.'}
                   </div>
                 )}
               </div>
