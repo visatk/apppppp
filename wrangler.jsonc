@@ -1,16 +1,36 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "xterm",
-	"main": "worker/index.ts",
-	"compatibility_date": "2026-05-20",
-	"assets": {
-		"not_found_handling": "single-page-application"
-	},
-	"observability": {
-		"enabled": true
-	},
-	"upload_source_maps": true,
-	"compatibility_flags": [
-		"nodejs_compat"
-	]
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xterm",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-05-20",
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "upload_source_maps": true,
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "Room",
+        "class_name": "Room"
+      },
+      {
+        "name": "Sandbox",
+        "class_name": "Sandbox"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Room", "Sandbox"]
+    }
+  ]
 }
